@@ -183,6 +183,7 @@ async function loadAllData() {
     Math.round((progress / 28) * 100) + '%'
   renderUploadedDates()
   renderWeekly()
+  renderLastWeekLeaderboard()
   renderMonth()
   renderTotalSteps()
   renderPenalties()
@@ -247,6 +248,42 @@ async function shareCard(cardId) {
   }
 }
 
+// ─── HELPER: CHECK IF REST WAS USED THIS WEEK ────────
+
+async function hasRestBeenUsedThisWeek(name, uploadDate) {
+  // Find Monday of the week for uploadDate
+  const uploadDateObj = new Date(uploadDate)
+  const dayOfWeek = uploadDateObj.getDay()
+  
+  // Calculate Monday of this week
+  let mondayDate = new Date(uploadDateObj)
+  if (dayOfWeek === 0) {
+    // If today is Sunday, Monday is tomorrow, but we want last Monday (6 days ago)
+    mondayDate.setDate(uploadDateObj.getDate() - 6)
+  } else {
+    // Otherwise, Monday is (dayOfWeek - 1) days ago
+    mondayDate.setDate(uploadDateObj.getDate() - (dayOfWeek - 1))
+  }
+  
+  // Scan history from Monday to today
+  const historySnap = await db.collection('groups').doc(currentGroup)
+    .collection('history').get()
+  
+  let restUsed = false
+  historySnap.forEach(doc => {
+    const docDate = new Date(doc.id)
+    if (docDate >= mondayDate && docDate <= uploadDateObj) {
+      const entries = doc.data().entries || []
+      const personEntry = entries.find(p => p.name === name)
+      if (personEntry && personEntry.steps < 7000 && personEntry.note && personEntry.note.includes('Flexi Rest Day')) {
+        restUsed = true
+      }
+    }
+  })
+  
+  return restUsed
+}
+
 // ─── UPLOAD ───────────────────────────────────────────
 
 function runAgent() {
@@ -302,9 +339,10 @@ async function processRows(rows, date) {
     membersMap[doc.id] = doc.data()
   })
 
+  // On Monday, reset the weekly step counter (not restUsed)
   if (day === 1) {
     for (let name in membersMap) {
-      membersMap[name].restUsed = false
+      membersMap[name].weekly = 0
     }
   }
 
@@ -329,7 +367,10 @@ async function processRows(rows, date) {
       penalties.push({ name, steps, date, note: '😂 Must complete penalty task! (Over 20k steps)' })
 
     } else if (steps < 7000) {
-      if (!membersMap[name].restUsed) {
+      // Scan history to check if rest was already used this week
+      const restAlreadyUsed = await hasRestBeenUsedThisWeek(name, date)
+      
+      if (!restAlreadyUsed) {
         pts = 10
         note = '🛋️ Flexi Rest Day! First rest this week (+10 pts)'
         membersMap[name].restUsed = true
@@ -339,10 +380,20 @@ async function processRows(rows, date) {
       }
 
     } else if (day === 0 && steps >= 7000) {
-      pts = 8
-      note = '🚶 Daily Walker! Walked every day this week (8 pts)'
-      penalties.push({ name, steps, date, note: '🚶 Daily Walker — walked 7k+ every day including Sunday' })
-
+      // Check if this person used a rest day this week
+      const restWasUsedThisWeek = await hasRestBeenUsedThisWeek(name, date)
+      
+      if (!restWasUsedThisWeek) {
+        // Only award Daily Walker if NO rest day was used
+        pts = 8
+        note = '🚶 Daily Walker! Walked every day this week (8 pts)'
+        penalties.push({ name, steps, date, note: '🚶 Daily Walker — walked 7k+ every day including Sunday' })
+      } else if (steps >= 10000) {
+        // Even if rest day was used, 10k+ on Sunday gets Sweet Spot bonus
+        pts = 10
+        note = '🎯 10K Sweet Spot (+10 pts)'
+      }
+      // Otherwise pts stays 0 (walked 7-10k on Sunday with rest day used)
     } else if (day !== 0 && steps >= 10000) {
       pts = 10
       note = '🎯 10K Sweet Spot (+10 pts)'
@@ -687,6 +738,93 @@ async function renderWeekly() {
         <td>${p.name}</td>
         <td>${Number(p.weekly || 0).toLocaleString()}</td>
         <td>${p.points || 0}</td>
+      </tr>`
+  })
+}
+
+async function renderLastWeekLeaderboard() {
+  // Find the latest date in history
+  const historySnap = await db.collection('groups').doc(currentGroup)
+    .collection('history').orderBy('date', 'desc').get()
+  
+  if (historySnap.empty) {
+    const body = document.querySelector('#lastWeekBoard tbody')
+    body.innerHTML = `<tr><td colspan="4" style="color:gray;text-align:center">No data yet</td></tr>`
+    return
+  }
+
+  // Get the most recent date
+  const latestDateStr = historySnap.docs[0].id
+  const latestDate = new Date(latestDateStr)
+  const latestDayOfWeek = latestDate.getDay()
+  
+  // Calculate the Monday of the PREVIOUS week
+  // First, get Monday of current week
+  let thisWeekMonday = new Date(latestDate)
+  if (latestDayOfWeek === 0) {
+    // If today is Sunday, Monday was 6 days ago, so previous Monday was 13 days ago
+    thisWeekMonday.setDate(latestDate.getDate() - 6)
+  } else {
+    // Otherwise, Monday is (dayOfWeek - 1) days ago
+    thisWeekMonday.setDate(latestDate.getDate() - (latestDayOfWeek - 1))
+  }
+  
+  // Get the Monday of the week before
+  let lastWeekMonday = new Date(thisWeekMonday)
+  lastWeekMonday.setDate(thisWeekMonday.getDate() - 7)
+  
+  // Calculate Sunday of last week
+  let lastWeekSunday = new Date(lastWeekMonday)
+  lastWeekSunday.setDate(lastWeekMonday.getDate() + 6)
+  
+  // Format dates as YYYY-MM-DD for comparison
+  const lastMondayStr = lastWeekMonday.toISOString().split('T')[0]
+  const lastSundayStr = lastWeekSunday.toISOString().split('T')[0]
+  
+  // Get all history docs
+  const allHistorySnap = await db.collection('groups').doc(currentGroup)
+    .collection('history').get()
+  
+  // Collect points and steps for each person from last week's Mon-Sun
+  const lastWeekData = {}
+  
+  allHistorySnap.forEach(doc => {
+    const docDate = doc.id
+    // Check if date falls within last week's Monday to Sunday
+    if (docDate >= lastMondayStr && docDate <= lastSundayStr) {
+      const entries = doc.data().entries || []
+      entries.forEach(entry => {
+        const name = entry.name
+        const pts = entry.pts || 0
+        const steps = Number(entry.steps) || 0
+        if (!lastWeekData[name]) lastWeekData[name] = { points: 0, steps: 0 }
+        lastWeekData[name].points += pts
+        lastWeekData[name].steps += steps
+      })
+    }
+  })
+  
+  // Sort and render
+  const sorted = Object.entries(lastWeekData)
+    .map(([name, data]) => ({ name, points: data.points, steps: data.steps }))
+    .sort((a, b) => b.points - a.points)
+  
+  const body = document.querySelector('#lastWeekBoard tbody')
+  body.innerHTML = ''
+  
+  if (sorted.length === 0) {
+    body.innerHTML = `<tr><td colspan="4" style="color:gray;text-align:center">No data for last week yet</td></tr>`
+    return
+  }
+  
+  sorted.forEach(({ name, points, steps }, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i + 1
+    body.innerHTML += `
+      <tr>
+        <td>${medal}</td>
+        <td>${name}</td>
+        <td>${steps.toLocaleString()}</td>
+        <td style="font-weight:bold;color:green">${points}</td>
       </tr>`
   })
 }
