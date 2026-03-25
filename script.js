@@ -727,7 +727,42 @@ async function renderWeekly() {
   snap.forEach(doc => {
     arr.push({ name: doc.id, ...doc.data() })
   })
-  arr.sort((a, b) => (b.points || 0) - (a.points || 0) || (b.weekly || 0) - (a.weekly || 0))
+  
+  // Get this week's points from history
+  const historySnap = await db.collection('groups').doc(currentGroup)
+    .collection('history').get()
+  
+  const today = new Date()
+  const dayOfWeek = today.getDay()
+  let weekMonday = new Date(today)
+  if (dayOfWeek === 0) {
+    weekMonday.setDate(today.getDate() - 6)
+  } else {
+    weekMonday.setDate(today.getDate() - (dayOfWeek - 1))
+  }
+  
+  const weekMondayStr = weekMonday.toISOString().split('T')[0]
+  const todayStr = today.toISOString().split('T')[0]
+  
+  const weekPointsMap = {}
+  historySnap.forEach(doc => {
+    const docDate = doc.id
+    if (docDate >= weekMondayStr && docDate <= todayStr) {
+      const entries = doc.data().entries || []
+      entries.forEach(entry => {
+        const name = entry.name
+        const pts = entry.pts || 0
+        if (!weekPointsMap[name]) weekPointsMap[name] = 0
+        weekPointsMap[name] += pts
+      })
+    }
+  })
+  
+  arr.forEach(p => {
+    p.weekPoints = weekPointsMap[p.name] || 0
+  })
+  
+  arr.sort((a, b) => b.weekPoints - a.weekPoints || (b.weekly || 0) - (a.weekly || 0))
   const body = document.querySelector('#weeklyBoard tbody')
   body.innerHTML = ''
   arr.forEach((p, i) => {
@@ -737,7 +772,7 @@ async function renderWeekly() {
         <td>${medal}</td>
         <td>${p.name}</td>
         <td>${Number(p.weekly || 0).toLocaleString()}</td>
-        <td>${p.points || 0}</td>
+        <td>${p.weekPoints}</td>
       </tr>`
   })
 }
@@ -807,7 +842,7 @@ async function renderLastWeekLeaderboard() {
   // Sort and render
   const sorted = Object.entries(lastWeekData)
     .map(([name, data]) => ({ name, points: data.points, steps: data.steps }))
-    .sort((a, b) => b.points - a.points)
+    .sort((a, b) => b.points - a.points || b.steps - a.steps)
   
   const body = document.querySelector('#lastWeekBoard tbody')
   body.innerHTML = ''
